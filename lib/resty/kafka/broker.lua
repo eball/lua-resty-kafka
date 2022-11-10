@@ -2,172 +2,62 @@
 
 
 local response = require "resty.kafka.response"
-local request = require "resty.kafka.request"
+local auth_utils = require "resty.kafka.auth.init"
 
 local to_int32 = response.to_int32
 local setmetatable = setmetatable
 local tcp = ngx.socket.tcp
-local pid = ngx.worker.pid
-local tostring = tostring
 
-local sasl = require "resty.kafka.sasl"
+local ngx_log = ngx.log
 
 local _M = {}
 local mt = { __index = _M }
 
-local flatten
-do
-  local __flatten
-  __flatten = function(t, buffer)
-    local _exp_0 = type(t)
-    if "string" == _exp_0 then
-      buffer[#buffer + 1] = t
-    elseif "number" == _exp_0 then
-      buffer[#buffer + 1] = tostring(t)
-    elseif "table" == _exp_0 then
-      for _index_0 = 1, #t do
-        local thing = t[_index_0]
-        __flatten(thing, buffer)
-      end
-    end
-  end
-  flatten = function(t)
-    local buffer = { }
-    __flatten(t, buffer)
-    return table.concat(buffer)
-  end
-end
 
-local function _sock_send_recieve(sock, request)
-    local bytes, err = sock:send(flatten(request:package()))
+local function _sock_send_receive(sock, request)
+    local bytes, err = sock:send(request:package())
     if not bytes then
         return nil, err, true
     end
-print(" send package bytes: " .. require("pl.pretty").write(flatten(request:package())))
+
+    -- Reading a 4 byte `message_size`
     local len, err = sock:receive(4)
+
     if not len then
         if err == "timeout" then
             sock:close()
             return nil, err
         end
-        return nil, " receive package len err: " .. err, true
+        return nil, err, true
     end
 
     local data, err = sock:receive(to_int32(len))
     if not data then
         if err == "timeout" then
             sock:close()
-            return nil, err
+            return nil, err, true
         end
-        return nil, " read data err: " .. err, true
     end
 
     return response:new(data, request.api_version), nil, true
 end
 
-local  function _api_version(sock, brk)
-    local cli_id = "worker" .. pid()
-    local req = request:new(request.ApiVersionsRequest, 0, cli_id, request.API_VERSION_V1)
 
-    local resp, err = _sock_send_recieve(sock, req, brk.config)
-
-    require("pl.pretty").dump(resp)
-
-end
-
-
-local function _sasl_handshake(sock, brk)
-
-    local cli_id = "worker" .. pid()
-    local req = request:new(request.SaslHandshakeRequest, 0, cli_id,
-                            request.API_VERSION_V0)
-
-    req:string(brk.auth.mechanism)
-
-    local resp, err = _sock_send_recieve(sock, req, brk.config)
-    if not resp  then
-        return nil, err
-    end
-
-    local err_code = resp:int16()
-    if err_code ~= 0 then
-        local error_msg = ""
-        if err_code == 33 then
-            local supported_mechanism_count = resp:int32()
-            local sms = {}
-            print("error ")
-            for i=1, supported_mechanism_count do
-                table.insert(sms, resp:string())
-            end
-            error_msg = ", supported mechanisms: " .. table.concat(sms, " ")
-        else
-            error_msg = resp:string()
-        end
-
-        return nil, "error code: " .. tostring(err_code) .. error_msg
-    end
-
-    return true
-end
-
-
-local function _sasl_auth(sock, brk)
-    local cli_id = "worker" .. pid()
-    local req = request:new(request.SaslAuthenticateRequest, 0, cli_id,
-                            request.API_VERSION_V0)
-
-    local msg = sasl.encode(brk.auth.mechanism, nil, brk.auth.user,
-                            brk.auth.password)
-
-    req:bytes(msg)
-
-    local resp, err = _sock_send_recieve(sock, req, brk.config)
-    if not resp  then
-        return nil, err
-    end
-
-    local err_code = resp:int16()
-    local error_msg = resp:string()
-    local auth_bytes = resp:bytes()
-
-    if err_code ~= 0 then
-        return nil, error_msg
-    end
-
-    return true
-end
-
-
-local function sasl_auth(sock, broker)
-    local ok, err = _sasl_handshake(sock, broker)
-    if  not ok then
-        return nil, " handshake err: " .. err
-    end
-
-    local ok, err = _sasl_auth(sock, broker)
-    if not ok then
-        return nil, " auth err: " .. err
-    end
-
-    return true
-end
-
-
-function _M.new(self, host, port, socket_config, sasl_config)
+function _M.new(self, host, port, socket_config, auth_config)
     return setmetatable({
         host = host,
         port = port,
         config = socket_config,
-        auth = sasl_config,
+        auth = auth_config or nil,
     }, mt)
 end
-
 
 function _M.send_receive(self, request)
     local sock, err = tcp()
     if not sock then
         return nil, err, true
     end
+    local keepalive = self.config.keepalive or false
 
     sock:settimeout(self.config.socket_timeout)
 
@@ -176,40 +66,46 @@ function _M.send_receive(self, request)
         return nil, err, true
     end
 
-    local times, err = sock:getreusedtimes()
-    if not times then
-        return nil, "failed to get reused time: " .. tostring(err), true
+    if self.config.ssl then
+        -- TODO: add reused_session for better performance of short-lived connections
+        local opts = {
+            ssl_verify = self.config.ssl_verify,
+            client_cert = self.config.client_cert,
+            client_priv_key = self.config.client_priv_key,
+        }
+
+        -- TODO END
+        local _, err = sock:tlshandshake(opts)
+        if err then
+            return nil, "failed to do SSL handshake with " ..
+                        self.host .. ":" .. tostring(self.port) .. ": " .. err, true
+        end
     end
 
-    _api_version(sock, self)
+    -- authenticate if auth config is passed and socked connection is new
+    if self.auth and sock:getreusedtimes() == 0 then -- SASL AUTH
+        local ok, auth, err
 
-    if self.config.ssl and times == 0 then
-        -- first connectted connnection
-        local ok, err = sock:sslhandshake(false, self.host,
-                                          self.config.ssl_verify)
+        auth, err = auth_utils.new(self.auth)
+
+        if not auth then
+            return nil, err
+        end
+
+        ok, err = auth:authenticate(sock)
         if not ok then
-            return nil, "failed to do SSL handshake with "
-                        ..  self.host .. ":" .. tostring(self.port) .. ": "
-                        .. err, true
+            local msg = "failed to do " .. self.auth.mechanism .." auth with " ..
+                        self.host .. ":" .. tostring(self.port) .. ": " .. err, true
+            return nil, msg
         end
     end
 
-    if self.auth and times == 0 then -- SASL AUTH
-        local ok, err = sasl_auth(sock, self)
-        if  not ok then
-            return nil, "failed to do " .. self.auth.mechanism .." auth with "
-                        ..  self.host .. ":" .. tostring(self.port) .. ": "
-                        .. err, true
-
-        end
+    local data, err, f = _sock_send_receive(sock, request)
+    if keepalive then
+        ngx_log(ngx.DEBUG, "storing sock in pool to keep-alive")
+        sock:setkeepalive(self.config.keepalive_timeout, self.config.keepalive_size)
     end
-
-    local data, err, retryable = _sock_send_recieve(sock, request)
-
-    sock:setkeepalive(self.config.keepalive_timeout, self.config.keepalive_size)
-
-    return data, err, retryable
+    return data, err, f
 end
-
 
 return _M
