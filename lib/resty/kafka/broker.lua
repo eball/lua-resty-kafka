@@ -15,20 +15,42 @@ local sasl = require "resty.kafka.sasl"
 local _M = {}
 local mt = { __index = _M }
 
+local flatten
+do
+  local __flatten
+  __flatten = function(t, buffer)
+    local _exp_0 = type(t)
+    if "string" == _exp_0 then
+      buffer[#buffer + 1] = t
+    elseif "number" == _exp_0 then
+      buffer[#buffer + 1] = tostring(t)
+    elseif "table" == _exp_0 then
+      for _index_0 = 1, #t do
+        local thing = t[_index_0]
+        __flatten(thing, buffer)
+      end
+    end
+  end
+  flatten = function(t)
+    local buffer = { }
+    __flatten(t, buffer)
+    return table.concat(buffer)
+  end
+end
 
 local function _sock_send_recieve(sock, request)
-    local bytes, err = sock:send(request:package())
+    local bytes, err = sock:send(flatten(request:package()))
     if not bytes then
         return nil, err, true
     end
-
+print(" send package bytes: " .. require("pl.pretty").write(flatten(request:package())))
     local len, err = sock:receive(4)
     if not len then
         if err == "timeout" then
             sock:close()
             return nil, err
         end
-        return nil, err, true
+        return nil, " receive package len err: " .. err, true
     end
 
     local data, err = sock:receive(to_int32(len))
@@ -37,17 +59,28 @@ local function _sock_send_recieve(sock, request)
             sock:close()
             return nil, err
         end
-        return nil, err, true
+        return nil, " read data err: " .. err, true
     end
 
     return response:new(data, request.api_version), nil, true
 end
 
+local  function _api_version(sock, brk)
+    local cli_id = "worker" .. pid()
+    local req = request:new(request.ApiVersionsRequest, 0, cli_id, request.API_VERSION_V1)
+
+    local resp, err = _sock_send_recieve(sock, req, brk.config)
+
+    require("pl.pretty").dump(resp)
+
+end
+
 
 local function _sasl_handshake(sock, brk)
+
     local cli_id = "worker" .. pid()
     local req = request:new(request.SaslHandshakeRequest, 0, cli_id,
-                            request.API_VERSION_V1)
+                            request.API_VERSION_V0)
 
     req:string(brk.auth.mechanism)
 
@@ -58,9 +91,20 @@ local function _sasl_handshake(sock, brk)
 
     local err_code = resp:int16()
     if err_code ~= 0 then
-        local error_msg = resp:string()
+        local error_msg = ""
+        if err_code == 33 then
+            local supported_mechanism_count = resp:int32()
+            local sms = {}
+            print("error ")
+            for i=1, supported_mechanism_count do
+                table.insert(sms, resp:string())
+            end
+            error_msg = ", supported mechanisms: " .. table.concat(sms, " ")
+        else
+            error_msg = resp:string()
+        end
 
-        return nil, error_msg
+        return nil, "error code: " .. tostring(err_code) .. error_msg
     end
 
     return true
@@ -70,7 +114,7 @@ end
 local function _sasl_auth(sock, brk)
     local cli_id = "worker" .. pid()
     local req = request:new(request.SaslAuthenticateRequest, 0, cli_id,
-                            request.API_VERSION_V1)
+                            request.API_VERSION_V0)
 
     local msg = sasl.encode(brk.auth.mechanism, nil, brk.auth.user,
                             brk.auth.password)
@@ -97,12 +141,12 @@ end
 local function sasl_auth(sock, broker)
     local ok, err = _sasl_handshake(sock, broker)
     if  not ok then
-        return nil, err
+        return nil, " handshake err: " .. err
     end
 
     local ok, err = _sasl_auth(sock, broker)
     if not ok then
-        return nil, err
+        return nil, " auth err: " .. err
     end
 
     return true
@@ -136,6 +180,8 @@ function _M.send_receive(self, request)
     if not times then
         return nil, "failed to get reused time: " .. tostring(err), true
     end
+
+    _api_version(sock, self)
 
     if self.config.ssl and times == 0 then
         -- first connectted connnection

@@ -140,7 +140,7 @@ local function _fetch_metadata(self, new_topic)
         local bk = broker:new(host, port, sc, sasl_config)
         local resp, err = bk:send_receive(req)
         if not resp then
-            ngx_log(INFO, "broker fetch metadata failed, err:", err,
+            ngx_log(ERR, "broker fetch metadata failed, err:", err,
                           ", host: ", host, ", port: ", port)
         else
             local brokers, topic_partitions = metadata_decode(resp)

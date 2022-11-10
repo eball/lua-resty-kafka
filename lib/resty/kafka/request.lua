@@ -102,6 +102,11 @@ function _M.new(self, apikey, correlation_id, client_id, api_version)
         req[6] = cid
         len = len + 2 + clen
         offset = offset + 2
+    else
+        req[5] = str_int16(0)
+--        req[6] = str_int32(0)
+        len = len + 2
+        offset = offset + 2
     end
 
     return setmetatable({
